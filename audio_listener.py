@@ -79,16 +79,16 @@ class AudioListener:
         return loopback_device
 
     def _calculate_rms(self, frame_bytes):
-        # Convert bytes to numpy array to calculate RMS
-        data = np.frombuffer(frame_bytes, dtype=np.int16)
+        # Convert bytes to numpy float32 array to calculate RMS
+        data = np.frombuffer(frame_bytes, dtype=np.float32)
         if len(data) == 0:
-            return 0
+            return 0.0
         return np.sqrt(np.mean(data.astype(np.float64)**2))
 
     def _calibrate_threshold(self, duration_sec=1.5):
         print(f"[*] Calibrating silence threshold for {duration_sec} seconds... Please do not play audio.")
         stream = self.p.open(
-            format=pyaudio.paInt16,
+            format=pyaudio.paFloat32,
             channels=self.channels,
             rate=self.rate,
             input=True,
@@ -118,11 +118,12 @@ class AudioListener:
             avg_rms = np.mean(rms_values)
             max_rms = np.max(rms_values)
             # Set threshold slightly above the max observed noise floor to avoid false triggers
-            self.silence_threshold = max(max_rms * 1.8, avg_rms + 350, 800.0)
-            print(f"[+] Calibration complete. Noise Floor Avg: {avg_rms:.1f}, Max: {max_rms:.1f}. Silence Threshold set to: {self.silence_threshold:.1f}")
+            # On Float32, RMS is in range [0.0, 1.0]. A safe threshold is 0.025 (equiv to 800 on int16 scale)
+            self.silence_threshold = max(max_rms * 1.8, avg_rms + 0.010, 0.025)
+            print(f"[+] Calibration complete. Noise Floor Avg: {avg_rms:.4f}, Max: {max_rms:.4f}. Silence Threshold set to: {self.silence_threshold:.4f}")
         else:
-            self.silence_threshold = 850.0
-            print(f"[!] Calibration failed. Set default Silence Threshold to: {self.silence_threshold}")
+            self.silence_threshold = 0.03
+            print(f"[!] Calibration failed. Set default Silence Threshold to: {self.silence_threshold:.4f}")
 
     def start(self):
         self.stop_event.clear()
@@ -165,23 +166,32 @@ class AudioListener:
         try:
             # Downmix and downsample in-memory to 16kHz mono to ensure perfect STT compatibility
             audio_bytes = b''.join(frames_to_save)
-            audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+            audio_float32 = np.frombuffer(audio_bytes, dtype=np.float32)
             
             # Truncate to multiple of channel size to avoid reshape error
-            num_samples = (len(audio_int16) // self.channels) * self.channels
-            audio_int16 = audio_int16[:num_samples]
-            audio_reshaped = audio_int16.reshape(-1, self.channels)
-            mono_48k = audio_reshaped.mean(axis=1)
+            num_samples = (len(audio_float32) // self.channels) * self.channels
+            audio_float32 = audio_float32[:num_samples]
+            audio_reshaped = audio_float32.reshape(-1, self.channels)
+            mono_orig = audio_reshaped.mean(axis=1)
             
-            # Downsample from self.rate to 16000Hz
-            factor = max(1, self.rate // 16000)
-            mono_16k = mono_48k[::factor].astype(np.int16)
+            # Downsample to exactly 16000Hz using linear interpolation
+            target_rate = 16000
+            if self.rate == target_rate:
+                mono_16k = mono_orig
+            else:
+                num_target_samples = int(len(mono_orig) * target_rate / self.rate)
+                x_orig = np.arange(len(mono_orig))
+                x_target = np.linspace(0, len(mono_orig) - 1, num_target_samples)
+                mono_16k = np.interp(x_target, x_orig, mono_orig)
+            
+            # Convert to int16 for standard WAV file storage
+            mono_16k_int16 = (mono_16k * 32767.0).clip(-32768, 32767).astype(np.int16)
             
             wf = wave.open(temp_filepath, 'wb')
             wf.setnchannels(1) # Mono
             wf.setsampwidth(2) # 16-bit (2 bytes)
             wf.setframerate(16000) # 16kHz
-            wf.writeframes(mono_16k.tobytes())
+            wf.writeframes(mono_16k_int16.tobytes())
             wf.close()
             
             # Push to processing queue
@@ -195,7 +205,7 @@ class AudioListener:
 
     def _record_loop(self):
         stream = self.p.open(
-            format=pyaudio.paInt16,
+            format=pyaudio.paFloat32,
             channels=self.channels,
             rate=self.rate,
             input=True,
@@ -210,16 +220,34 @@ class AudioListener:
         startup_chunks_to_skip = int(0.5 * self.rate / self.chunk_size)
         
         while not self.stop_event.is_set():
-            has_data = True
             try:
                 available = stream.get_read_available()
                 if available < self.chunk_size:
-                    has_data = False
-                    rms = 0.0
-                    time.sleep(0.01)
-                else:
-                    data = stream.read(self.chunk_size, exception_on_overflow=False)
-                    rms = self._calculate_rms(data)
+                    # No data available right now. Sleep briefly to not hog CPU
+                    time.sleep(0.005)
+                    
+                    # Track silence timeout even when there is no new data from WASAPI loopback
+                    with self.lock:
+                        if self.is_speech_active:
+                            if self.silence_start_time is None:
+                                self.silence_start_time = time.time()
+                            elif time.time() - self.silence_start_time >= self.silence_seconds:
+                                # Silence duration exceeded: Speech turn ended
+                                min_speech_duration_sec = 0.4
+                                min_speech_chunks = int(min_speech_duration_sec * self.rate / self.chunk_size)
+                                if self.speech_chunks_count >= min_speech_chunks:
+                                    self._save_and_queue_segment()
+                                else:
+                                    self.accumulated_frames.clear()
+                                    
+                                self.is_speech_active = False
+                                self.silence_start_time = None
+                                self.speech_chunks_count = 0
+                    continue
+                
+                # Read data since it's available
+                data = stream.read(self.chunk_size, exception_on_overflow=False)
+                rms = self._calculate_rms(data)
             except IOError:
                 # Overflow/Underflow error, skip chunk
                 continue
@@ -234,26 +262,18 @@ class AudioListener:
                 if rms > self.silence_threshold:
                     if not self.is_speech_active:
                         self.is_speech_active = True
-                        # print("\n[🎙️] Speech detected...")
                     self.accumulated_frames.append(data)
                     self.speech_chunks_count += 1
                     self.silence_start_time = None
                 else:
                     if self.is_speech_active:
-                        if has_data:
-                            self.accumulated_frames.append(data)
-                        else:
-                            # Generate a silent chunk of zeros to preserve audio continuity
-                            silent_chunk = b'\x00' * (self.chunk_size * 2 * self.channels)
-                            self.accumulated_frames.append(silent_chunk)
-                            
+                        # Append the quiet but real data
+                        self.accumulated_frames.append(data)
+                        
                         if self.silence_start_time is None:
                             self.silence_start_time = time.time()
                         elif time.time() - self.silence_start_time >= self.silence_seconds:
                             # Silence duration exceeded: Speech turn ended
-                            # print("\n[⏹️] Silence detected. Turn complete.")
-                            
-                            # Only queue if we have accumulated enough speech chunks to avoid brief noise spikes (pops, clicks)
                             min_speech_duration_sec = 0.4
                             min_speech_chunks = int(min_speech_duration_sec * self.rate / self.chunk_size)
                             if self.speech_chunks_count >= min_speech_chunks:

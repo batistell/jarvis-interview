@@ -42,10 +42,8 @@ class AssistantEngine:
         cuda_available = ctranslate2.get_cuda_device_count() > 0
         
         # Set device dynamically if auto is selected
-        # We default Whisper to CPU for stability and to prevent numerical hallucinations
-        # on certain GPU configurations, while freeing GPU memory for the LLM.
         if whisper_device == "auto":
-            self.whisper_device = "cpu"
+            self.whisper_device = "cuda" if cuda_available else "cpu"
         else:
             self.whisper_device = whisper_device
             
@@ -140,65 +138,12 @@ class AssistantEngine:
                 print(f"[-] Error loading Whisper model on CPU: {e}", file=sys.stderr)
                 sys.exit(1)
             
-        # 2. Initialize CTranslate2 Generator & Tokenizer locally
-        print(f"[*] Loading local Qwen LLM model from '{self.llm_dir}'...")
+        # LLM placeholders for lazy loading
         self.generator = None
-        
-        # Try CUDA first if requested/available
-        if self.llm_device == "cuda":
-            try:
-                print("[*] Trying to load Qwen on GPU (CUDA)...")
-                self.generator = ctranslate2.Generator(
-                    self.llm_dir, 
-                    device="cuda",
-                    compute_type=self.llm_compute
-                )
-                self.tokenizer = AutoTokenizer.from_pretrained(self.llm_dir)
-                print("[+] Qwen model loaded on GPU.")
-                
-                # Warm up Qwen on GPU to verify CUDA execution works
-                print("[*] Warming up Qwen model on GPU...")
-                warmup_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode("<|im_start|>system\nWarmup<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"))
-                self.generator.generate_batch([warmup_tokens], max_length=5)
-                print("[+] Qwen model warmed up on GPU successfully.")
-            except Exception as e:
-                print(f"[!] Warning: Failed to load or warm up Qwen on GPU: {e}. Falling back to CPU.", file=sys.stderr)
-                self.generator = None
-                self.llm_device = "cpu"
-                self.llm_compute = "int8"
-                
-        # Load on CPU if CUDA was not requested, not available, or failed
-        if self.generator is None:
-            print("[*] Loading Qwen model on CPU (device='cpu', compute_type='int8')...")
-            try:
-                self.generator = ctranslate2.Generator(
-                    self.llm_dir, 
-                    device="cpu",
-                    compute_type="int8"
-                )
-                self.tokenizer = AutoTokenizer.from_pretrained(self.llm_dir)
-                print("[+] Qwen model loaded on CPU successfully.")
-                
-                # Warm up Qwen on CPU
-                print("[*] Warming up Qwen model on CPU...")
-                warmup_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode("<|im_start|>system\nWarmup<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"))
-                self.generator.generate_batch([warmup_tokens], max_length=5)
-                print("[+] Qwen model warmed up on CPU successfully.")
-            except Exception as e:
-                print(f"[-] Error loading local Qwen LLM on CPU: {e}", file=sys.stderr)
-                print("[-] Please run 'python download_models.py' first to download the model files.", file=sys.stderr)
-                sys.exit(1)
-        
-        # Ingest project files & style context (Docs only by default for speed on CPU)
-        print("[*] Indexing face-registry codebase (docs only) and style context...")
-        self.codebase_context = repo_indexer.index_codebase(include_code=False)
-        self.style_context = repo_indexer.load_style_template()
-        print(f"[+] Context ready. Codebase size: {len(self.codebase_context)} chars. Style template size: {len(self.style_context)} chars.")
-        
-        # System prompt definition
-        self.system_prompt = self._build_system_prompt()
-        
-        # Conversation history
+        self.tokenizer = None
+        self.codebase_context = None
+        self.style_context = None
+        self.system_prompt = None
         self.history = []
 
     def _build_system_prompt(self):
@@ -269,10 +214,76 @@ CONTEXTO COMPLETO DO PROJETO (código fonte e documentações do repositório fa
         # Filter out hallucinations
         return self._filter_hallucinations(text)
 
+    def _load_llm(self):
+        """Loads local Qwen LLM model and indexes the codebase context lazily."""
+        if self.generator is not None:
+            return
+            
+        import ctranslate2
+        from transformers import AutoTokenizer
+        
+        print(f"[*] Loading local Qwen LLM model from '{self.llm_dir}'...")
+        
+        # Try CUDA first if requested/available
+        if self.llm_device == "cuda":
+            try:
+                print("[*] Trying to load Qwen on GPU (CUDA)...")
+                self.generator = ctranslate2.Generator(
+                    self.llm_dir, 
+                    device="cuda",
+                    compute_type=self.llm_compute
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(self.llm_dir)
+                print("[+] Qwen model loaded on GPU.")
+                
+                # Warm up Qwen on GPU to verify CUDA execution works
+                print("[*] Warming up Qwen model on GPU...")
+                warmup_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode("<|im_start|>system\nWarmup<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"))
+                self.generator.generate_batch([warmup_tokens], max_length=5)
+                print("[+] Qwen model warmed up on GPU successfully.")
+            except Exception as e:
+                print(f"[!] Warning: Failed to load or warm up Qwen on GPU: {e}. Falling back to CPU.", file=sys.stderr)
+                self.generator = None
+                self.llm_device = "cpu"
+                self.llm_compute = "int8"
+                
+        # Load on CPU if CUDA was not requested, not available, or failed
+        if self.generator is None:
+            print("[*] Loading Qwen model on CPU (device='cpu', compute_type='int8')...")
+            try:
+                self.generator = ctranslate2.Generator(
+                    self.llm_dir, 
+                    device="cpu",
+                    compute_type="int8"
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(self.llm_dir)
+                print("[+] Qwen model loaded on CPU successfully.")
+                
+                # Warm up Qwen on CPU
+                print("[*] Warming up Qwen model on CPU...")
+                warmup_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode("<|im_start|>system\nWarmup<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"))
+                self.generator.generate_batch([warmup_tokens], max_length=5)
+                print("[+] Qwen model warmed up on CPU successfully.")
+            except Exception as e:
+                print(f"[-] Error loading local Qwen LLM on CPU: {e}", file=sys.stderr)
+                print("[-] Please run 'python download_models.py' first to download the model files.", file=sys.stderr)
+                sys.exit(1)
+        
+        # Ingest project files & style context
+        print("[*] Indexing face-registry codebase (docs only) and style context...")
+        self.codebase_context = repo_indexer.index_codebase(include_code=False)
+        self.style_context = repo_indexer.load_style_template()
+        print(f"[+] Context ready. Codebase size: {len(self.codebase_context)} chars. Style template size: {len(self.style_context)} chars.")
+        
+        # System prompt definition
+        self.system_prompt = self._build_system_prompt()
+
     def generate_answer(self, question_text):
         """Generates suggested answer using local Qwen model based on codebase context and style."""
         if not question_text:
             return "Nenhuma fala detectada."
+            
+        self._load_llm()
             
         # Limit history to the last 6 messages (3 turns) to keep context and inference window fast
         if len(self.history) > 6:

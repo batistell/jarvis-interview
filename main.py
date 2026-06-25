@@ -58,7 +58,7 @@ def print_welcome_panel(llm_model, whisper_model):
 def main():
     # Configuration
     LLM_MODEL = "qwen2.5-1.5b-ct2"
-    WHISPER_MODEL_SIZE = "base"
+    WHISPER_MODEL_SIZE = "large-v3"
     WHISPER_DEVICE = "auto"  # Detects and uses "cuda" if Nvidia GPU is available
     LLM_DEVICE = "auto"      # Detects and uses "cuda" if Nvidia GPU is available
     
@@ -79,6 +79,7 @@ def main():
         silence_threshold=None, # Auto-calibrated
         silence_seconds=1.5
     )
+    listener.live_printed = False
     
     # Worker function for processing queue
     def process_queue_worker():
@@ -88,21 +89,36 @@ def main():
                 break
                 
             try:
-                console.print("\n[bold yellow][*] Transcrevendo áudio final do recrutador...[/bold yellow]")
+                # Clear the live transcription line raw via stdout to prevent [K from printing
+                with listener.lock:
+                    if getattr(listener, "live_printed", False):
+                        sys.stdout.write("\r\x1b[K")
+                        sys.stdout.flush()
+                        listener.live_printed = False
+                    
+                    # Print the transcribing status on the same line (no leading \n)
+                    msg = "[*] Transcrevendo áudio final do recrutador..."
+                    console.print(f"[bold yellow]{msg}[/bold yellow]", end="")
+                    sys.stdout.flush()
+                    listener.live_printed = True
+                
                 question_text = assistant.transcribe(wav_path)
                 
-                if not question_text:
-                    continue
+                # Clear the transcribing status line raw via stdout
+                with listener.lock:
+                    if getattr(listener, "live_printed", False):
+                        sys.stdout.write("\r\x1b[K")
+                        sys.stdout.flush()
+                        listener.live_printed = False
                     
-                console.print(f"\n[bold cyan]❓ Recrutador:[/bold cyan] {question_text}")
-                console.print("[bold yellow][*] Processando resposta técnica com modelo local...[/bold yellow]")
+                    if not question_text:
+                        console.print("[dim]Aguardando próxima pergunta... [Enter] para cortar | [Q] sair[/dim]")
+                        continue
+                        
+                    # Print the final question on the same line (no leading \n)
+                    console.print(f"[bold cyan]❓ Recrutador:[/bold cyan] {question_text}")
                 
-                answer = assistant.generate_answer(question_text)
-                
-                # Render answer in a beautiful markdown panel
-                console.print("\n")
-                console.print(Panel(Markdown(answer), title="Sugestão de Resposta (Jarvis)", border_style="green", expand=False))
-                console.print("\n[dim]Aguardando próxima pergunta... [Enter] para cortar | [R] para regerar | [C] limpar | [Q] sair[/dim]")
+                console.print("\n[dim]Aguardando próxima pergunta... [Enter] para cortar | [Q] sair[/dim]")
                 
             except Exception as ex:
                 console.print(f"\n[bold red][-] Erro ao processar áudio: {ex}[/bold red]", style="red")
@@ -131,48 +147,79 @@ def main():
                 # Run live STT only if we have at least 1 second of audio
                 if len(frames) > int(listener.rate / listener.chunk_size * 1.0):
                     try:
-                        # Convert byte frames to int16 numpy array
+                        # Convert byte frames to float32 numpy array
                         audio_bytes = b''.join(frames)
-                        audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+                        audio_float32 = np.frombuffer(audio_bytes, dtype=np.float32)
                         
                         # Reshape to channels (stereo) and downmix to mono by taking the mean
-                        audio_reshaped = audio_int16.reshape(-1, listener.channels)
-                        mono_48k = audio_reshaped.mean(axis=1)
+                        num_samples = (len(audio_float32) // listener.channels) * listener.channels
+                        audio_float32 = audio_float32[:num_samples]
+                        audio_reshaped = audio_float32.reshape(-1, listener.channels)
+                        mono_orig = audio_reshaped.mean(axis=1)
                         
-                        # Downsample from 48kHz to 16kHz by taking every 3rd sample
-                        mono_16k = mono_48k[::3]
+                        # Downsample to exactly 16000Hz using linear interpolation
+                        target_rate = 16000
+                        if listener.rate == target_rate:
+                            mono_16k = mono_orig
+                        else:
+                            num_target_samples = int(len(mono_orig) * target_rate / listener.rate)
+                            x_orig = np.arange(len(mono_orig))
+                            x_target = np.linspace(0, len(mono_orig) - 1, num_target_samples)
+                            mono_16k = np.interp(x_target, x_orig, mono_orig)
                         
-                        # Convert to float32 normalized to [-1.0, 1.0]
-                        audio_float32 = mono_16k.astype(np.float32) / 32768.0
+                        audio_float32_input = mono_16k.astype(np.float32)
                         
-                        # Transcribe locally with beam_size=1 for instant performance
-                        segments, info = assistant.whisper.transcribe(audio_float32, language="pt", beam_size=1)
+                        # Transcribe locally with beam_size=1 and VAD filter enabled to strip silences/noise
+                        segments, info = assistant.whisper.transcribe(
+                            audio_float32_input, 
+                            language="pt", 
+                            beam_size=1,
+                            vad_filter=True
+                        )
                         text = " ".join([segment.text for segment in segments]).strip()
                         
                         # Apply assistant's hallucination filter
                         text = assistant._filter_hallucinations(text)
                         
                         if text:
-                            # Print on the same line using \r and clearing to the end of the line
-                            console.print(f"\r\x1b[K[bold yellow][🎙️] Ouvindo recrutador:[/bold yellow] {text}", end="")
-                            sys.stdout.flush()
-                            last_text = text
-                            live_printed = True
+                            # Limit the real-time text to the last 50 characters to prevent line wrapping
+                            max_preview_len = 50
+                            preview_text = text
+                            if len(preview_text) > max_preview_len:
+                                preview_text = "..." + preview_text[-max_preview_len:]
+                                
+                            with listener.lock:
+                                sys.stdout.write("\r\x1b[K")
+                                sys.stdout.flush()
+                                msg = f"[🎙️] Ouvindo recrutador: {preview_text}"
+                                console.print(f"[bold yellow]{msg}[/bold yellow]", end="")
+                                sys.stdout.flush()
+                                last_text = text
+                                live_printed = True
+                                listener.live_printed = True
                     except Exception as e:
                         pass
                 else:
                     # Immediate feedback when speech begins but is under 1 second of buffer
                     if not live_printed or last_text == "":
-                        console.print(f"\r\x1b[K[bold yellow][🎙️] Capturando áudio do recrutador...[/bold yellow]", end="")
-                        sys.stdout.flush()
-                        live_printed = True
+                        with listener.lock:
+                            sys.stdout.write("\r\x1b[K")
+                            sys.stdout.flush()
+                            msg = "[🎙️] Capturando áudio do recrutador..."
+                            console.print(f"[bold yellow]{msg}[/bold yellow]", end="")
+                            sys.stdout.flush()
+                            live_printed = True
+                            listener.live_printed = True
                 time.sleep(0.5)  # Check more frequently (every 0.5 seconds) for faster updates
             else:
                 if live_printed:
-                    console.print("\r\x1b[K", end="")
-                    sys.stdout.flush()
-                    live_printed = False
-                    last_text = ""
+                    with listener.lock:
+                        if getattr(listener, "live_printed", False):
+                            sys.stdout.write("\r\x1b[K")
+                            sys.stdout.flush()
+                            listener.live_printed = False
+                        live_printed = False
+                        last_text = ""
                 time.sleep(0.1)
                 
     # Start live transcription thread
