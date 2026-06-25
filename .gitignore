@@ -1,0 +1,7 @@
+.venv/
+models/
+face-registry/
+temp_interview.wav
+__pycache__/
+*.pyc
+*.log
