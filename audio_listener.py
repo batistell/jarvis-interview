@@ -34,6 +34,8 @@ class AudioListener:
         self.is_recording = False
         self.is_speech_active = False
         self.silence_start_time = None
+        self.speech_chunks_count = 0
+        self.current_rms = 0.0
         self.lock = threading.Lock()
         
         # Silence threshold calibration
@@ -98,9 +100,15 @@ class AudioListener:
         start_time = time.time()
         while time.time() - start_time < duration_sec:
             try:
-                data = stream.read(self.chunk_size)
-                rms = self._calculate_rms(data)
-                rms_values.append(rms)
+                available = stream.get_read_available()
+                if available >= self.chunk_size:
+                    data = stream.read(self.chunk_size, exception_on_overflow=False)
+                    rms = self._calculate_rms(data)
+                    rms_values.append(rms)
+                else:
+                    # Windows loopback does not feed frames when silent. Register 0.0 RMS and wait.
+                    rms_values.append(0.0)
+                    time.sleep(0.01)
             except IOError:
                 continue
                 
@@ -110,10 +118,10 @@ class AudioListener:
             avg_rms = np.mean(rms_values)
             max_rms = np.max(rms_values)
             # Set threshold slightly above the max observed noise floor to avoid false triggers
-            self.silence_threshold = max(max_rms * 1.5, avg_rms + 200, 350.0)
+            self.silence_threshold = max(max_rms * 1.8, avg_rms + 350, 800.0)
             print(f"[+] Calibration complete. Noise Floor Avg: {avg_rms:.1f}, Max: {max_rms:.1f}. Silence Threshold set to: {self.silence_threshold:.1f}")
         else:
-            self.silence_threshold = 400.0
+            self.silence_threshold = 850.0
             print(f"[!] Calibration failed. Set default Silence Threshold to: {self.silence_threshold}")
 
     def start(self):
@@ -140,6 +148,7 @@ class AudioListener:
                 self._save_and_queue_segment()
                 self.is_speech_active = False
                 self.silence_start_time = None
+                self.speech_chunks_count = 0
 
     def _save_and_queue_segment(self):
         if not self.accumulated_frames:
@@ -154,11 +163,25 @@ class AudioListener:
         temp_file.close()
         
         try:
+            # Downmix and downsample in-memory to 16kHz mono to ensure perfect STT compatibility
+            audio_bytes = b''.join(frames_to_save)
+            audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+            
+            # Truncate to multiple of channel size to avoid reshape error
+            num_samples = (len(audio_int16) // self.channels) * self.channels
+            audio_int16 = audio_int16[:num_samples]
+            audio_reshaped = audio_int16.reshape(-1, self.channels)
+            mono_48k = audio_reshaped.mean(axis=1)
+            
+            # Downsample from self.rate to 16000Hz
+            factor = max(1, self.rate // 16000)
+            mono_16k = mono_48k[::factor].astype(np.int16)
+            
             wf = wave.open(temp_filepath, 'wb')
-            wf.setnchannels(self.channels)
-            wf.setsampwidth(self.p.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(self.rate)
-            wf.writeframes(b''.join(frames_to_save))
+            wf.setnchannels(1) # Mono
+            wf.setsampwidth(2) # 16-bit (2 bytes)
+            wf.setframerate(16000) # 16kHz
+            wf.writeframes(mono_16k.tobytes())
             wf.close()
             
             # Push to processing queue
@@ -182,14 +205,30 @@ class AudioListener:
         
         print("[*] Listening to system audio...")
         
+        # Skip the first 0.5s of audio to discard startup pops/clicks from WASAPI device init
+        startup_chunks_skipped = 0
+        startup_chunks_to_skip = int(0.5 * self.rate / self.chunk_size)
+        
         while not self.stop_event.is_set():
+            has_data = True
             try:
-                data = stream.read(self.chunk_size, exception_on_overflow=False)
+                available = stream.get_read_available()
+                if available < self.chunk_size:
+                    has_data = False
+                    rms = 0.0
+                    time.sleep(0.01)
+                else:
+                    data = stream.read(self.chunk_size, exception_on_overflow=False)
+                    rms = self._calculate_rms(data)
             except IOError:
                 # Overflow/Underflow error, skip chunk
                 continue
                 
-            rms = self._calculate_rms(data)
+            if startup_chunks_skipped < startup_chunks_to_skip:
+                startup_chunks_skipped += 1
+                continue
+                
+            self.current_rms = rms
             
             with self.lock:
                 if rms > self.silence_threshold:
@@ -197,17 +236,33 @@ class AudioListener:
                         self.is_speech_active = True
                         # print("\n[🎙️] Speech detected...")
                     self.accumulated_frames.append(data)
+                    self.speech_chunks_count += 1
                     self.silence_start_time = None
                 else:
                     if self.is_speech_active:
-                        self.accumulated_frames.append(data)
+                        if has_data:
+                            self.accumulated_frames.append(data)
+                        else:
+                            # Generate a silent chunk of zeros to preserve audio continuity
+                            silent_chunk = b'\x00' * (self.chunk_size * 2 * self.channels)
+                            self.accumulated_frames.append(silent_chunk)
+                            
                         if self.silence_start_time is None:
                             self.silence_start_time = time.time()
                         elif time.time() - self.silence_start_time >= self.silence_seconds:
                             # Silence duration exceeded: Speech turn ended
                             # print("\n[⏹️] Silence detected. Turn complete.")
-                            self._save_and_queue_segment()
+                            
+                            # Only queue if we have accumulated enough speech chunks to avoid brief noise spikes (pops, clicks)
+                            min_speech_duration_sec = 0.4
+                            min_speech_chunks = int(min_speech_duration_sec * self.rate / self.chunk_size)
+                            if self.speech_chunks_count >= min_speech_chunks:
+                                self._save_and_queue_segment()
+                            else:
+                                self.accumulated_frames.clear()
+                                
                             self.is_speech_active = False
                             self.silence_start_time = None
+                            self.speech_chunks_count = 0
                             
         stream.close()

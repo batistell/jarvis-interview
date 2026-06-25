@@ -1,45 +1,193 @@
 import os
 import sys
+from pathlib import Path
+
+# Keep DLL references alive in memory on Windows to prevent garbage collection
+_dll_handles = []
+
+if sys.platform == "win32":
+    # Register NVIDIA CUDA DLLs from both our site-packages and the sister jarvis project if available
+    site_packages_our = Path(sys.prefix) / "Lib" / "site-packages"
+    site_packages_ref = Path("o:/Python/jarvis/.venv/Lib/site-packages")
+    
+    for site_pkg in [site_packages_our, site_packages_ref]:
+        nvidia_dir = site_pkg / "nvidia"
+        if nvidia_dir.exists():
+            for bin_dir in nvidia_dir.glob("**/bin"):
+                try:
+                    resolved_path = str(bin_dir.resolve())
+                    # Add to PATH so C++ binding DLLs (ctranslate2) can find them
+                    os.environ["PATH"] = resolved_path + os.pathsep + os.environ["PATH"]
+                    # Register DLL directory for Python 3.8+
+                    handle = os.add_dll_directory(resolved_path)
+                    _dll_handles.append(handle)
+                except Exception:
+                    pass
+
 import ctranslate2
 from transformers import AutoTokenizer
 from faster_whisper import WhisperModel
 import repo_indexer
 
 class AssistantEngine:
-    def __init__(self, ollama_model=None, whisper_model_size="base", whisper_device="cpu", llm_device="cpu"):
+    def __init__(self, ollama_model=None, whisper_model_size="base", whisper_device="auto", llm_device="auto"):
         self.whisper_model_size = whisper_model_size
-        self.whisper_device = whisper_device
-        self.llm_device = llm_device
         
         # Local paths
         project_root = repo_indexer.get_project_root()
         self.whisper_dir = os.path.join(project_root, "models", "whisper")
         self.llm_dir = os.path.join(project_root, "models", "llm")
         
+        # Auto-detect CUDA availability
+        cuda_available = ctranslate2.get_cuda_device_count() > 0
+        
+        # Set device dynamically if auto is selected
+        # We default Whisper to CPU for stability and to prevent numerical hallucinations
+        # on certain GPU configurations, while freeing GPU memory for the LLM.
+        if whisper_device == "auto":
+            self.whisper_device = "cpu"
+        else:
+            self.whisper_device = whisper_device
+            
+        if llm_device == "auto":
+            self.llm_device = "cuda" if cuda_available else "cpu"
+        else:
+            self.llm_device = llm_device
+            
+        # Set optimal compute type based on device
+        self.whisper_compute = "int8_float16" if self.whisper_device == "cuda" else "int8"
+        self.llm_compute = "float16" if self.llm_device == "cuda" else "int8"
+        
+        print(f"[+] Device Selection - STT: {self.whisper_device} ({self.whisper_compute}) | LLM: {self.llm_device} ({self.llm_compute})")
+        
         # 1. Initialize Whisper model locally
-        print(f"[*] Loading local Whisper model '{whisper_model_size}' (Device: {whisper_device})...")
-        try:
-            self.whisper = WhisperModel(
-                self.whisper_model_size,
-                device=self.whisper_device,
-                compute_type="int8",
-                download_root=self.whisper_dir
-            )
-            print("[+] Whisper model loaded successfully.")
-        except Exception as e:
-            print(f"[-] Error loading Whisper model: {e}", file=sys.stderr)
-            sys.exit(1)
+        print(f"[*] Loading local Whisper model '{whisper_model_size}'...")
+        self.whisper = None
+        
+        # Try CUDA first if requested/available
+        if self.whisper_device == "cuda":
+            try:
+                print("[*] Trying to load Whisper on GPU (CUDA)...")
+                self.whisper = WhisperModel(
+                    self.whisper_model_size,
+                    device="cuda",
+                    compute_type=self.whisper_compute,
+                    download_root=self.whisper_dir
+                )
+                print("[+] Whisper model loaded on GPU.")
+                
+                # Warm up Whisper on GPU to check if DLLs are present and compile kernels
+                print("[*] Warming up Whisper model on GPU...")
+                import tempfile
+                import wave
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                    warmup_wav = temp_file.name
+                try:
+                    wf = wave.open(warmup_wav, 'wb')
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2) # 16-bit (2 bytes)
+                    wf.setframerate(16000)
+                    wf.writeframes(b'\x00' * 16000)
+                    wf.close()
+                    # Run a transcribe to verify CUDA execution works (force evaluation with list)
+                    list(self.whisper.transcribe(warmup_wav, language="pt", beam_size=1)[0])
+                    print("[+] Whisper model warmed up on GPU successfully.")
+                finally:
+                    try:
+                        os.remove(warmup_wav)
+                    except:
+                        pass
+            except Exception as e:
+                print(f"[!] Warning: Failed to load or warm up Whisper on GPU: {e}. Falling back to CPU.", file=sys.stderr)
+                self.whisper = None
+                self.whisper_device = "cpu"
+                self.whisper_compute = "int8"
+                
+        # Load on CPU if CUDA was not requested, not available, or failed
+        if self.whisper is None:
+            print("[*] Loading Whisper model on CPU (device='cpu', compute_type='int8')...")
+            try:
+                self.whisper = WhisperModel(
+                    self.whisper_model_size,
+                    device="cpu",
+                    compute_type="int8",
+                    download_root=self.whisper_dir
+                )
+                print("[+] Whisper model loaded on CPU successfully.")
+                
+                # Warm up on CPU to ensure it's ready
+                print("[*] Warming up Whisper model on CPU...")
+                import tempfile
+                import wave
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                    warmup_wav = temp_file.name
+                try:
+                    wf = wave.open(warmup_wav, 'wb')
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(b'\x00' * 16000)
+                    wf.close()
+                    # Force evaluation with list
+                    list(self.whisper.transcribe(warmup_wav, language="pt", beam_size=1)[0])
+                    print("[+] Whisper model warmed up on CPU successfully.")
+                finally:
+                    try:
+                        os.remove(warmup_wav)
+                    except:
+                        pass
+            except Exception as e:
+                print(f"[-] Error loading Whisper model on CPU: {e}", file=sys.stderr)
+                sys.exit(1)
             
         # 2. Initialize CTranslate2 Generator & Tokenizer locally
-        print(f"[*] Loading local Qwen LLM model from '{self.llm_dir}' (Device: {llm_device})...")
-        try:
-            self.generator = ctranslate2.Generator(self.llm_dir, device=self.llm_device)
-            self.tokenizer = AutoTokenizer.from_pretrained(self.llm_dir)
-            print("[+] Local Qwen LLM loaded successfully.")
-        except Exception as e:
-            print(f"[-] Error loading local Qwen LLM: {e}", file=sys.stderr)
-            print("[-] Please run 'python download_models.py' first to download the model files.", file=sys.stderr)
-            sys.exit(1)
+        print(f"[*] Loading local Qwen LLM model from '{self.llm_dir}'...")
+        self.generator = None
+        
+        # Try CUDA first if requested/available
+        if self.llm_device == "cuda":
+            try:
+                print("[*] Trying to load Qwen on GPU (CUDA)...")
+                self.generator = ctranslate2.Generator(
+                    self.llm_dir, 
+                    device="cuda",
+                    compute_type=self.llm_compute
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(self.llm_dir)
+                print("[+] Qwen model loaded on GPU.")
+                
+                # Warm up Qwen on GPU to verify CUDA execution works
+                print("[*] Warming up Qwen model on GPU...")
+                warmup_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode("<|im_start|>system\nWarmup<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"))
+                self.generator.generate_batch([warmup_tokens], max_length=5)
+                print("[+] Qwen model warmed up on GPU successfully.")
+            except Exception as e:
+                print(f"[!] Warning: Failed to load or warm up Qwen on GPU: {e}. Falling back to CPU.", file=sys.stderr)
+                self.generator = None
+                self.llm_device = "cpu"
+                self.llm_compute = "int8"
+                
+        # Load on CPU if CUDA was not requested, not available, or failed
+        if self.generator is None:
+            print("[*] Loading Qwen model on CPU (device='cpu', compute_type='int8')...")
+            try:
+                self.generator = ctranslate2.Generator(
+                    self.llm_dir, 
+                    device="cpu",
+                    compute_type="int8"
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(self.llm_dir)
+                print("[+] Qwen model loaded on CPU successfully.")
+                
+                # Warm up Qwen on CPU
+                print("[*] Warming up Qwen model on CPU...")
+                warmup_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode("<|im_start|>system\nWarmup<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"))
+                self.generator.generate_batch([warmup_tokens], max_length=5)
+                print("[+] Qwen model warmed up on CPU successfully.")
+            except Exception as e:
+                print(f"[-] Error loading local Qwen LLM on CPU: {e}", file=sys.stderr)
+                print("[-] Please run 'python download_models.py' first to download the model files.", file=sys.stderr)
+                sys.exit(1)
         
         # Ingest project files & style context (Docs only by default for speed on CPU)
         print("[*] Indexing face-registry codebase (docs only) and style context...")
@@ -71,15 +219,55 @@ CONTEXTO COMPLETO DO PROJETO (código fonte e documentações do repositório fa
 {self.codebase_context}
 """
 
-    def transcribe(self, wav_path):
-        """Transcribes audio file using local Whisper model."""
-        if not os.path.exists(wav_path):
+    def _filter_hallucinations(self, text: str) -> str:
+        """Filtra alucinações ou preenchimentos comuns do Whisper causados por ruído ou silêncio."""
+        cleaned = text.strip().lower()
+        # Remove pontuação comum para normalizar a comparação
+        for p in [".", ",", "!", "?", "-", '"', "'", "(", ")", "[", "]", "{", "}", "!", " "]:
+            cleaned = cleaned.replace(p, "")
+        cleaned = cleaned.strip()
+
+        # Alucinações típicas do Whisper sob ruído ou silêncio
+        hallucinations = {
+            "thankyou", "thankyouverymuch", "thankyouforwatching", "thanksforwatching",
+            "subtitlesbyamaraorg", "subtitles", "amaraorg", "you", "ha", "yeah", "bye",
+            "please", "ok", "right", "obrigado", "obrigada", "obrigadoporassistir",
+            "muitoobrigado", "tchau", "sweetheart"
+        }
+
+        # Normalize comparison by removing spaces too
+        cleaned_no_spaces = cleaned.replace(" ", "")
+        
+        # Discard static noise containing known Whisper hallucination words
+        if "screwdriver" in cleaned_no_spaces or "sweetheart" in cleaned_no_spaces:
             return ""
             
-        # Transcribe with Portuguese hint
-        segments, info = self.whisper.transcribe(wav_path, language="pt", beam_size=5)
-        text = " ".join([segment.text for segment in segments]).strip()
+        if cleaned_no_spaces in hallucinations:
+            return ""
+
+        # Ignora ruídos que resultam em strings extremamente curtas
+        if len(cleaned) < 2:
+            return ""
+
         return text
+
+    def transcribe(self, wav_path_or_ndarray):
+        """Transcribes audio file or numpy array using local Whisper model."""
+        if isinstance(wav_path_or_ndarray, str):
+            if not os.path.exists(wav_path_or_ndarray):
+                return ""
+            
+        # Transcribe with Portuguese hint and VAD filter enabled to strip silences/noise
+        segments, info = self.whisper.transcribe(
+            wav_path_or_ndarray, 
+            language="pt", 
+            beam_size=1,
+            vad_filter=True
+        )
+        text = " ".join([segment.text for segment in segments]).strip()
+        
+        # Filter out hallucinations
+        return self._filter_hallucinations(text)
 
     def generate_answer(self, question_text):
         """Generates suggested answer using local Qwen model based on codebase context and style."""

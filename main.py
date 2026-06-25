@@ -5,10 +5,27 @@ import time
 import queue
 import threading
 import msvcrt
+import numpy as np
 
-# Force stdout/stderr to utf-8 to avoid encoding errors with emojis on Windows cmd/powershell
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# Suppress noisy library warnings (like missing PyTorch or Symlink warning on Windows)
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+# Enable Virtual Terminal Processing on Windows to support ANSI escape sequences natively
+if sys.platform == "win32":
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        hStdOut = kernel32.GetStdHandle(-11) # STD_OUTPUT_HANDLE
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(hStdOut, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(hStdOut, mode.value | 0x0004) # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+# Force stdout/stderr to utf-8 with line buffering to avoid delays and encoding errors with emojis on Windows
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
 
 from rich.console import Console
 from rich.panel import Panel
@@ -42,8 +59,8 @@ def main():
     # Configuration
     LLM_MODEL = "qwen2.5-1.5b-ct2"
     WHISPER_MODEL_SIZE = "base"
-    WHISPER_DEVICE = "cpu"  # Change to "cuda" if Nvidia GPU is available
-    LLM_DEVICE = "cpu"      # Change to "cuda" if Nvidia GPU is available
+    WHISPER_DEVICE = "auto"  # Detects and uses "cuda" if Nvidia GPU is available
+    LLM_DEVICE = "auto"      # Detects and uses "cuda" if Nvidia GPU is available
     
     # Thread-safe queue for audio files
     audio_queue = queue.Queue()
@@ -71,13 +88,13 @@ def main():
                 break
                 
             try:
-                console.print("\n[bold yellow][*] Transcrevendo áudio do entrevistador...[/bold yellow]")
+                console.print("\n[bold yellow][*] Transcrevendo áudio final do recrutador...[/bold yellow]")
                 question_text = assistant.transcribe(wav_path)
                 
                 if not question_text:
                     continue
                     
-                console.print(f"\n[bold cyan]❓ Entrevistador:[/bold cyan] {question_text}")
+                console.print(f"\n[bold cyan]❓ Recrutador:[/bold cyan] {question_text}")
                 console.print("[bold yellow][*] Processando resposta técnica com modelo local...[/bold yellow]")
                 
                 answer = assistant.generate_answer(question_text)
@@ -105,10 +122,6 @@ def main():
     stop_live_transcription = threading.Event()
     
     def live_transcription_worker():
-        import tempfile
-        import wave
-        import pyaudiowpatch as pyaudio
-        
         live_printed = False
         last_text = ""
         
@@ -117,40 +130,47 @@ def main():
                 frames = listener.get_current_frames()
                 # Run live STT only if we have at least 1 second of audio
                 if len(frames) > int(listener.rate / listener.chunk_size * 1.0):
-                    # Save frames to a temp live WAV
-                    temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                    temp_filepath = temp_file.name
-                    temp_file.close()
-                    
                     try:
-                        wf = wave.open(temp_filepath, 'wb')
-                        wf.setnchannels(listener.channels)
-                        wf.setsampwidth(listener.p.get_sample_size(pyaudio.paInt16))
-                        wf.setframerate(listener.rate)
-                        wf.writeframes(b''.join(frames))
-                        wf.close()
+                        # Convert byte frames to int16 numpy array
+                        audio_bytes = b''.join(frames)
+                        audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+                        
+                        # Reshape to channels (stereo) and downmix to mono by taking the mean
+                        audio_reshaped = audio_int16.reshape(-1, listener.channels)
+                        mono_48k = audio_reshaped.mean(axis=1)
+                        
+                        # Downsample from 48kHz to 16kHz by taking every 3rd sample
+                        mono_16k = mono_48k[::3]
+                        
+                        # Convert to float32 normalized to [-1.0, 1.0]
+                        audio_float32 = mono_16k.astype(np.float32) / 32768.0
                         
                         # Transcribe locally with beam_size=1 for instant performance
-                        segments, info = assistant.whisper.transcribe(temp_filepath, language="pt", beam_size=1)
+                        segments, info = assistant.whisper.transcribe(audio_float32, language="pt", beam_size=1)
                         text = " ".join([segment.text for segment in segments]).strip()
                         
-                        if text and text != last_text:
+                        # Apply assistant's hallucination filter
+                        text = assistant._filter_hallucinations(text)
+                        
+                        if text:
                             # Print on the same line using \r and clearing to the end of the line
-                            console.print(f"\r\x1b[K[bold yellow][🎙️] Ouvindo:[/bold yellow] {text}", end="")
+                            console.print(f"\r\x1b[K[bold yellow][🎙️] Ouvindo recrutador:[/bold yellow] {text}", end="")
+                            sys.stdout.flush()
                             last_text = text
                             live_printed = True
-                    except Exception:
+                    except Exception as e:
                         pass
-                    finally:
-                        try:
-                            os.remove(temp_filepath)
-                        except Exception:
-                            pass
-                time.sleep(0.8)  # Check every 0.8 seconds during speech
+                else:
+                    # Immediate feedback when speech begins but is under 1 second of buffer
+                    if not live_printed or last_text == "":
+                        console.print(f"\r\x1b[K[bold yellow][🎙️] Capturando áudio do recrutador...[/bold yellow]", end="")
+                        sys.stdout.flush()
+                        live_printed = True
+                time.sleep(0.5)  # Check more frequently (every 0.5 seconds) for faster updates
             else:
                 if live_printed:
-                    # Clear the live line when speech ends
                     console.print("\r\x1b[K", end="")
+                    sys.stdout.flush()
                     live_printed = False
                     last_text = ""
                 time.sleep(0.1)
@@ -161,6 +181,9 @@ def main():
     
     # Start audio listener
     listener.start()
+    
+    console.print("\n[bold green][+] Jarvis está pronto e em prontidão![/bold green] Pode iniciar a chamada ou reproduzir som.")
+    console.print("[dim]Aguardando o recrutador começar a falar...[/dim]\n")
     
     # Background generation helper
     def run_regeneration():
