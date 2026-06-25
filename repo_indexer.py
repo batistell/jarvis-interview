@@ -9,6 +9,11 @@ def get_project_root():
     return os.path.dirname(os.path.abspath(__file__))
 
 def ensure_repo_cloned():
+    # If the user-specified directory exists, use it directly!
+    local_path = r"O:\JavaProjects\face-registry"
+    if os.path.exists(local_path):
+        return local_path
+        
     project_root = get_project_root()
     repo_path = os.path.join(project_root, CLONE_DIR)
     
@@ -73,6 +78,46 @@ def index_codebase(include_code=False):
                         indexed_content.append(f"=== FILE: {rel_path} ===\n{content}\n")
 
     return "\n".join(indexed_content)
+
+def index_codebase_as_dict(include_code=False):
+    repo_path = ensure_repo_cloned()
+    if not os.path.exists(repo_path):
+        return {}
+
+    docs = {}
+
+    # 1. Index root markdown files
+    root_mds = ["README.md", "challenge.md", "abc.md"]
+    for md in root_mds:
+        file_path = os.path.join(repo_path, md)
+        if os.path.exists(file_path):
+            content = read_file_safely(file_path)
+            docs[md] = content
+
+    # 2. Index docs/ directory
+    docs_dir = os.path.join(repo_path, "docs")
+    if os.path.exists(docs_dir):
+        for root, _, files in os.walk(docs_dir):
+            for file in files:
+                if file.endswith(".md"):
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, repo_path)
+                    content = read_file_safely(file_path)
+                    docs[rel_path] = content
+
+    # 3. Index backend source code (Java files) if requested
+    if include_code:
+        java_dir = os.path.join(repo_path, "backend", "src", "main", "java")
+        if os.path.exists(java_dir):
+            for root, _, files in os.walk(java_dir):
+                for file in files:
+                    if file.endswith(".java"):
+                        file_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(file_path, repo_path)
+                        content = read_file_safely(file_path)
+                        docs[rel_path] = content
+
+    return docs
 
 def load_style_template():
     project_root = get_project_root()

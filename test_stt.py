@@ -51,14 +51,13 @@ class TestSTT(unittest.TestCase):
             f"Expected 'imagem' in transcription, got: '{transcription}'"
         )
         
-        # 2. Test LLM answer generation based on the transcription (Temporarily disabled for pure STT test)
-        # print("[*] Generating LLM Answer based on transcription...")
-        # answer = self.engine.generate_answer(transcription)
-        # print(f"[+] Generated answer:\n{answer}\n")
-        # self.assertTrue(len(answer) > 0, "Generated answer is empty!")
-        # self.assertNotEqual(answer, "Nenhuma fala detectada.", "LLM did not receive the transcription text.")
-        # self.assertNotIn("Erro", answer, f"LLM generated an error response: {answer}")
-        pass
+        # 2. Test LLM answer generation based on the transcription
+        print("[*] Generating LLM Answer based on transcription...")
+        answer = self.engine.generate_answer(transcription)
+        print(f"[+] Generated answer:\n{answer}\n")
+        self.assertTrue(len(answer) > 0, "Generated answer is empty!")
+        self.assertNotEqual(answer, "Nenhuma fala detectada.", "LLM did not receive the transcription text.")
+        self.assertNotIn("Erro", answer, f"LLM generated an error response: {answer}")
 
 if __name__ == "__main__":
     unittest.main()

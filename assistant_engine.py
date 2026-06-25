@@ -54,7 +54,7 @@ class AssistantEngine:
             
         # Set optimal compute type based on device
         self.whisper_compute = "int8_float16" if self.whisper_device == "cuda" else "int8"
-        self.llm_compute = "float16" if self.llm_device == "cuda" else "int8"
+        self.llm_compute = "int8_float16" if self.llm_device == "cuda" else "int8"
         
         print(f"[+] Device Selection - STT: {self.whisper_device} ({self.whisper_compute}) | LLM: {self.llm_device} ({self.llm_compute})")
         
@@ -138,15 +138,17 @@ class AssistantEngine:
                 print(f"[-] Error loading Whisper model on CPU: {e}", file=sys.stderr)
                 sys.exit(1)
             
-        # LLM placeholders for lazy loading
+        # LLM placeholders
         self.generator = None
         self.tokenizer = None
-        self.codebase_context = None
+        self.codebase_docs = None
         self.style_context = None
-        self.system_prompt = None
         self.history = []
+        
+        # Load LLM model eagerly at startup
+        self._load_llm()
 
-    def _build_system_prompt(self):
+    def _build_system_prompt(self, codebase_context):
         return f"""Você é o Jarvis Interview, um copiloto de inteligência artificial rodando localmente. O seu papel é auxiliar o candidato a responder perguntas técnicas de entrevista sobre o projeto "Face Registry" em tempo real.
 
 INSTRUÇÕES CRÍTICAS DE ESTILO E TOM:
@@ -160,8 +162,8 @@ REFERÊNCIA DE ESTILO (interview-example.md):
 {self.style_context}
 
 ---
-CONTEXTO COMPLETO DO PROJETO (código fonte e documentações do repositório face-registry):
-{self.codebase_context}
+CONTEXTO RELEVANTE DO PROJETO (código fonte e documentações do repositório face-registry):
+{codebase_context}
 """
 
     def _filter_hallucinations(self, text: str) -> str:
@@ -269,28 +271,78 @@ CONTEXTO COMPLETO DO PROJETO (código fonte e documentações do repositório fa
                 print("[-] Please run 'python download_models.py' first to download the model files.", file=sys.stderr)
                 sys.exit(1)
         
-        # Ingest project files & style context
+        # Ingest project files as a dictionary for RAG retrieval & style context
         print("[*] Indexing face-registry codebase (docs only) and style context...")
-        self.codebase_context = repo_indexer.index_codebase(include_code=False)
+        self.codebase_docs = repo_indexer.index_codebase_as_dict(include_code=False)
         self.style_context = repo_indexer.load_style_template()
-        print(f"[+] Context ready. Codebase size: {len(self.codebase_context)} chars. Style template size: {len(self.style_context)} chars.")
-        
-        # System prompt definition
-        self.system_prompt = self._build_system_prompt()
+        print(f"[+] Context ready. Indexed {len(self.codebase_docs)} documents. Style template size: {len(self.style_context)} chars.")
 
-    def generate_answer(self, question_text):
+    def _retrieve_relevant_context(self, question, max_chars=25000):
+        """Retorna os documentos mais relevantes do projeto com base nas palavras-chave da pergunta (Mini-RAG)."""
+        stopwords = {
+            "de", "a", "o", "que", "e", "do", "da", "em", "um", "para", "com", "na", "no", 
+            "uma", "os", "as", "se", "por", "como", "mais", "ao", "aos", "como", "foi", 
+            "das", "dos", "qual", "quais", "como", "por que", "onde", "quando", "quem", "você"
+        }
+        # Tokenize question words
+        q_words = set(w for w in question.lower().split() if w.isalnum() and w not in stopwords)
+        
+        if not q_words or not self.codebase_docs:
+            readme = self.codebase_docs.get("README.md", "") if self.codebase_docs else ""
+            return f"=== FILE: README.md ===\n{readme}\n"
+            
+        scores = []
+        for path, content in self.codebase_docs.items():
+            content_lower = content.lower()
+            raw_score = sum(content_lower.count(word) for word in q_words)
+            # Length normalization (prioritize focused docs over huge files)
+            score = raw_score / (len(content) ** 0.5) if len(content) > 0 else 0
+            scores.append((score, raw_score, path))
+            
+        scores.sort(key=lambda x: x[0], reverse=True)
+        
+        selected_docs = []
+        current_chars = 0
+        
+        # Always prioritize README.md as the core project entry context
+        if "README.md" in self.codebase_docs:
+            readme_content = self.codebase_docs["README.md"]
+            selected_docs.append(f"=== FILE: README.md ===\n{readme_content}\n")
+            current_chars += len(readme_content)
+            
+        for score, raw, path in scores:
+            if path == "README.md":
+                continue
+            if raw == 0:
+                continue # Ignore completely irrelevant files
+                
+            doc_str = f"=== FILE: {path} ===\n{self.codebase_docs[path]}\n"
+            # Knapsack packing
+            if current_chars + len(doc_str) <= max_chars:
+                selected_docs.append(doc_str)
+                current_chars += len(doc_str)
+            else:
+                continue # Try to fit other smaller files
+                
+        return "\n".join(selected_docs)
+
+    def generate_answer(self, question_text, callback=None):
         """Generates suggested answer using local Qwen model based on codebase context and style."""
         if not question_text:
             return "Nenhuma fala detectada."
             
         self._load_llm()
+        
+        # Retrieve the relevant context dynamically (RAG)
+        codebase_context = self._retrieve_relevant_context(question_text)
+        system_prompt = self._build_system_prompt(codebase_context)
             
         # Limit history to the last 6 messages (3 turns) to keep context and inference window fast
         if len(self.history) > 6:
             self.history = self.history[-6:]
             
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": system_prompt},
             *self.history,
             {"role": "user", "content": question_text}
         ]
@@ -305,12 +357,24 @@ CONTEXTO COMPLETO DO PROJETO (código fonte e documentações do repositório fa
             # Tokenize input text to tokens
             tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(formatted_prompt))
             
+            accumulated_ids = []
+            
+            def ctranslate2_callback(step_result):
+                accumulated_ids.append(step_result.token_id)
+                if callback:
+                    # Decode accumulated tokens so far and pass to the callback
+                    current_text = self.tokenizer.decode(accumulated_ids, skip_special_tokens=True).strip()
+                    callback(current_text)
+                return False
+            
             # Generate response
             results = self.generator.generate_batch(
                 [tokens],
                 max_length=512,
+                include_prompt_in_result=False,
                 sampling_topk=20,
-                sampling_temperature=0.7
+                sampling_temperature=0.7,
+                callback=ctranslate2_callback if callback else None
             )
             
             # Decode generated output tokens
@@ -325,7 +389,7 @@ CONTEXTO COMPLETO DO PROJETO (código fonte e documentações do repositório fa
         except Exception as e:
             return f"Erro ao gerar resposta com LLM local: {e}"
 
-    def regenerate_last_answer(self):
+    def regenerate_last_answer(self, callback=None):
         """Regenerates the answer to the last question."""
         if len(self.history) < 2:
             return "Nenhuma resposta anterior para regenerar."
@@ -338,7 +402,7 @@ CONTEXTO COMPLETO DO PROJETO (código fonte e documentações do repositório fa
         prompt_with_variation = last_question["content"] + "\n(Forneça uma variação diferente de resposta ou detalhe outro ponto da implementação)."
         
         print("[*] Regenerating last answer with variation...")
-        return self.generate_answer(prompt_with_variation)
+        return self.generate_answer(prompt_with_variation, callback=callback)
 
     def clear_history(self):
         self.history.clear()

@@ -118,6 +118,19 @@ def main():
                     # Print the final question on the same line (no leading \n)
                     console.print(f"[bold cyan]❓ Recrutador:[/bold cyan] {question_text}")
                 
+                console.print("[bold yellow][*] Processando resposta técnica com modelo local...[/bold yellow]")
+                
+                from rich.live import Live
+                panel_title = "Sugestão de Resposta (Jarvis)"
+                panel = Panel("", title=panel_title, border_style="green", expand=False)
+                
+                with Live(panel, console=console, auto_refresh=False) as live:
+                    def stream_cb(current_text):
+                        live.update(Panel(Markdown(current_text), title=panel_title, border_style="green", expand=False))
+                        live.refresh()
+                    
+                    answer = assistant.generate_answer(question_text, callback=stream_cb)
+                
                 console.print("\n[dim]Aguardando próxima pergunta... [Enter] para cortar | [Q] sair[/dim]")
                 
             except Exception as ex:
@@ -235,9 +248,18 @@ def main():
     # Background generation helper
     def run_regeneration():
         console.print("\n[bold yellow][*] Regenerando última resposta com variação...[/bold yellow]")
-        answer = assistant.regenerate_last_answer()
-        console.print("\n")
-        console.print(Panel(Markdown(answer), title="Sugestão de Resposta (Regenerada)", border_style="green", expand=False))
+        
+        from rich.live import Live
+        panel_title = "Sugestão de Resposta (Regenerada)"
+        panel = Panel("", title=panel_title, border_style="green", expand=False)
+        
+        with Live(panel, console=console, auto_refresh=False) as live:
+            def stream_cb(current_text):
+                live.update(Panel(Markdown(current_text), title=panel_title, border_style="green", expand=False))
+                live.refresh()
+                
+            answer = assistant.regenerate_last_answer(callback=stream_cb)
+            
         console.print("\n[dim]Aguardando próxima pergunta...[/dim]")
 
     # Main keyboard listener loop (non-blocking)
