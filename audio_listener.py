@@ -9,24 +9,41 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 
 class AudioListener:
-    def __init__(self, processing_queue, silence_threshold=None, silence_seconds=1.5, chunk_size=1024):
+    def __init__(self, processing_queue, silence_threshold=None, silence_seconds=1.5, chunk_size=1024, device_mode="loopback"):
         self.processing_queue = processing_queue
         self.silence_seconds = silence_seconds
         self.chunk_size = chunk_size
+        self.device_mode = device_mode
         
         self.p = pyaudio.PyAudio()
-        self.loopback_device = self._find_loopback_device()
         
-        if not self.loopback_device:
-            print("[-] Error: No WASAPI loopback device found. Cannot record system audio.", file=sys.stderr)
-            self.p.terminate()
-            sys.exit(1)
+        if self.device_mode == "loopback":
+            self.device_info = self._find_loopback_device()
+            if not self.device_info:
+                print("[-] Error: No WASAPI loopback device found. Cannot record system audio.", file=sys.stderr)
+                self.p.terminate()
+                sys.exit(1)
+            print(f"[+] Using loopback device: {self.device_info['name']}")
+        else:
+            try:
+                self.device_info = self.p.get_default_input_device_info()
+            except OSError:
+                self.device_info = None
+                for i in range(self.p.get_device_count()):
+                    info = self.p.get_device_info_by_index(i)
+                    if info["maxInputChannels"] > 0 and not info.get("isLoopbackDevice", False):
+                        self.device_info = info
+                        break
+            if not self.device_info:
+                print("[-] Error: No input device (microphone) found. Cannot record audio.", file=sys.stderr)
+                self.p.terminate()
+                sys.exit(1)
+            print(f"[+] Using microphone device: {self.device_info['name']}")
             
-        self.rate = int(self.loopback_device["defaultSampleRate"])
-        self.channels = int(self.loopback_device["maxInputChannels"])
-        self.device_index = int(self.loopback_device["index"])
+        self.rate = int(self.device_info["defaultSampleRate"])
+        self.channels = int(self.device_info["maxInputChannels"])
+        self.device_index = int(self.device_info["index"])
         
-        print(f"[+] Using loopback device: {self.loopback_device['name']}")
         print(f"[+] Audio Format: {self.channels} channels, {self.rate}Hz")
         
         # Audio accumulator
@@ -86,7 +103,10 @@ class AudioListener:
         return np.sqrt(np.mean(data.astype(np.float64)**2))
 
     def _calibrate_threshold(self, duration_sec=1.5):
-        print(f"[*] Calibrating silence threshold for {duration_sec} seconds... Please do not play audio.")
+        if self.device_mode == "loopback":
+            print(f"[*] Calibrating silence threshold for {duration_sec} seconds... Please do not play audio.")
+        else:
+            print(f"[*] Calibrating silence threshold for {duration_sec} seconds... Please remain silent.")
         stream = self.p.open(
             format=pyaudio.paFloat32,
             channels=self.channels,
@@ -213,7 +233,10 @@ class AudioListener:
             frames_per_buffer=self.chunk_size
         )
         
-        print("[*] Listening to system audio...")
+        if self.device_mode == "loopback":
+            print("[*] Listening to system audio...")
+        else:
+            print("[*] Listening to microphone audio...")
         
         # Skip the first 0.5s of audio to discard startup pops/clicks from WASAPI device init
         startup_chunks_skipped = 0

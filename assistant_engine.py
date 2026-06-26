@@ -144,25 +144,22 @@ class AssistantEngine:
         self.codebase_docs = None
         self.style_context = None
         self.history = []
+        self.interrupt_requested = False
+        import threading
+        self.generation_lock = threading.Lock()
         
         # Load LLM model eagerly at startup
         self._load_llm()
 
     def _build_system_prompt(self, codebase_context):
-        return f"""Você é o Jarvis Interview, um copiloto de inteligência artificial rodando localmente. O seu papel é auxiliar o candidato a responder perguntas técnicas de entrevista sobre o projeto "Face Registry" em tempo real.
+        return f"""Você é o Jarvis, um copiloto de inteligência artificial. O seu papel é auxiliar o candidato a responder perguntas técnicas de entrevista sobre o projeto "Face Registry" em tempo real.
 
-INSTRUÇÕES CRÍTICAS DE ESTILO E TOM:
-1. Fale EXATAMENTE com o mesmo tom, estilo, vocabulário e estrutura do candidato. Use o arquivo 'interview-example.md' abaixo como guia de referência absoluto para o seu estilo de escrita.
-2. Evite rodeios, introduções ou "Claro, vou ajudar". Vá DIRETO ao ponto técnico.
-3. Forneça respostas CURTAS e estruturadas em tópicos (talking points) fáceis de ler. O candidato precisa bater o olho na tela e conseguir falar a resposta de forma fluida em menos de 1 minuto.
-4. Fale na primeira pessoa do singular ("Eu escolhi...", "Eu utilizei..."), assumindo o papel do desenvolvedor do projeto.
+INSTRUÇÕES DE TOM E ESTILO:
+1. Vá DIRETO ao ponto técnico. Não faça introduções, não dê saudações, nem use frases como "Claro, vou ajudar".
+2. Responda em Português na primeira pessoa do singular ("Eu escolhi...", "Eu utilizei...", "No meu projeto..."), como o desenvolvedor da solução.
+3. Forneça uma resposta PEQUENA, contínua e explicada de forma falada (como em uma conversa). Evite tópicos ou bullet points. A resposta deve ser fluida e direta para ser falada em menos de 1 minuto.
 
----
-REFERÊNCIA DE ESTILO (interview-example.md):
-{self.style_context}
-
----
-CONTEXTO RELEVANTE DO PROJETO (código fonte e documentações do repositório face-registry):
+CONTEXTO RELEVANTE DO PROJETO:
 {codebase_context}
 """
 
@@ -271,11 +268,10 @@ CONTEXTO RELEVANTE DO PROJETO (código fonte e documentações do repositório f
                 print("[-] Please run 'python download_models.py' first to download the model files.", file=sys.stderr)
                 sys.exit(1)
         
-        # Ingest project files as a dictionary for RAG retrieval & style context
-        print("[*] Indexing face-registry codebase (docs only) and style context...")
+        # Ingest project files as a dictionary for RAG retrieval
+        print("[*] Indexing face-registry codebase (docs only)...")
         self.codebase_docs = repo_indexer.index_codebase_as_dict(include_code=False)
-        self.style_context = repo_indexer.load_style_template()
-        print(f"[+] Context ready. Indexed {len(self.codebase_docs)} documents. Style template size: {len(self.style_context)} chars.")
+        print(f"[+] Context ready. Indexed {len(self.codebase_docs)} documents.")
 
     def _retrieve_relevant_context(self, question, max_chars=25000):
         """Retorna os documentos mais relevantes do projeto com base nas palavras-chave da pergunta (Mini-RAG)."""

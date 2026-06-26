@@ -37,11 +37,12 @@ from assistant_engine import AssistantEngine
 # Initialize Rich Console for beautiful styling
 console = Console()
 
-def print_welcome_panel(llm_model, whisper_model):
+def print_welcome_panel(llm_model, whisper_model, device_mode):
+    mode_desc = "**Ouvindo áudio do computador...** (Microfone ignorado)" if device_mode == "loopback" else "**Ouvindo microfone...** (Áudio do computador ignorado)"
     welcome_text = f"""
 # 🎙️ Jarvis Interview Copilot (Local & Offline)
 
-**Ouvindo áudio do computador...** (Microfone ignorado)
+{mode_desc}
 
 ## Controles do Teclado:
 * **[Enter]** : Forçar processamento imediato (corta a gravação atual e gera a resposta).
@@ -56,6 +57,24 @@ def print_welcome_panel(llm_model, whisper_model):
     console.print(Panel(Markdown(welcome_text), title="Jarvis v1.0", border_style="cyan"))
 
 def main():
+    # Prompt for audio source selection
+    console.print(Panel(
+        "[bold cyan]🎙️ Seleção da Fonte de Áudio[/bold cyan]\n\n"
+        "[1] **Áudio do Computador** (WASAPI Loopback - grava a chamada/speakers)\n"
+        "[2] **Microfone** (Grava a sua própria voz ou o som do ambiente)",
+        title="Jarvis Setup",
+        border_style="cyan"
+    ))
+    
+    choice = ""
+    while choice not in ("1", "2"):
+        choice = input("Selecione a opção [1 ou 2, padrão: 1]: ").strip()
+        if not choice:
+            choice = "1"
+            
+    device_mode = "loopback" if choice == "1" else "microphone"
+    speaker_label = "Recrutador" if device_mode == "loopback" else "Você/Microfone"
+
     # Configuration
     LLM_MODEL = "qwen2.5-1.5b-ct2"
     WHISPER_MODEL_SIZE = "large-v3"
@@ -66,7 +85,7 @@ def main():
     audio_queue = queue.Queue()
     
     # Initialize Assistant Engine (Local Whisper + Local Qwen)
-    print_welcome_panel(LLM_MODEL, WHISPER_MODEL_SIZE)
+    print_welcome_panel(LLM_MODEL, WHISPER_MODEL_SIZE, device_mode)
     assistant = AssistantEngine(
         whisper_model_size=WHISPER_MODEL_SIZE,
         whisper_device=WHISPER_DEVICE,
@@ -77,7 +96,8 @@ def main():
     listener = AudioListener(
         processing_queue=audio_queue,
         silence_threshold=None, # Auto-calibrated
-        silence_seconds=1.5
+        silence_seconds=1.5,
+        device_mode=device_mode
     )
     listener.live_printed = False
     
@@ -97,7 +117,7 @@ def main():
                         listener.live_printed = False
                     
                     # Print the transcribing status on the same line (no leading \n)
-                    msg = "[*] Transcrevendo áudio final do recrutador..."
+                    msg = f"[*] Transcrevendo áudio final ({speaker_label.lower()})..."
                     console.print(f"[bold yellow]{msg}[/bold yellow]", end="")
                     sys.stdout.flush()
                     listener.live_printed = True
@@ -116,7 +136,7 @@ def main():
                         continue
                         
                     # Print the final question on the same line (no leading \n)
-                    console.print(f"[bold cyan]❓ Recrutador:[/bold cyan] {question_text}")
+                    console.print(f"[bold cyan]❓ {speaker_label}:[/bold cyan] {question_text}")
                 
                 console.print("[bold yellow][*] Processando resposta técnica com modelo local...[/bold yellow]")
                 
@@ -204,7 +224,7 @@ def main():
                             with listener.lock:
                                 sys.stdout.write("\r\x1b[K")
                                 sys.stdout.flush()
-                                msg = f"[🎙️] Ouvindo recrutador: {preview_text}"
+                                msg = f"[🎙️] Ouvindo {speaker_label.lower()}: {preview_text}"
                                 console.print(f"[bold yellow]{msg}[/bold yellow]", end="")
                                 sys.stdout.flush()
                                 last_text = text
@@ -218,7 +238,7 @@ def main():
                         with listener.lock:
                             sys.stdout.write("\r\x1b[K")
                             sys.stdout.flush()
-                            msg = "[🎙️] Capturando áudio do recrutador..."
+                            msg = f"[🎙️] Capturando áudio ({speaker_label.lower()})..."
                             console.print(f"[bold yellow]{msg}[/bold yellow]", end="")
                             sys.stdout.flush()
                             live_printed = True
@@ -242,8 +262,8 @@ def main():
     # Start audio listener
     listener.start()
     
-    console.print("\n[bold green][+] Jarvis está pronto e em prontidão![/bold green] Pode iniciar a chamada ou reproduzir som.")
-    console.print("[dim]Aguardando o recrutador começar a falar...[/dim]\n")
+    console.print(f"\n[bold green][+] Jarvis está pronto e em prontidão![/bold green] Pode iniciar a chamada ou reproduzir som.")
+    console.print(f"[dim]Aguardando {speaker_label.lower()} começar a falar...[/dim]\n")
     
     # Background generation helper
     def run_regeneration():
