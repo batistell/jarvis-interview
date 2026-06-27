@@ -32,7 +32,7 @@ from rich.panel import Panel
 from rich.markdown import Markdown
 
 from audio_listener import AudioListener
-from assistant_engine import AssistantEngine
+from assistant_engine import AssistantEngine, clear_gpu_memory
 
 # Initialize Rich Console for beautiful styling
 console = Console()
@@ -57,39 +57,61 @@ def print_welcome_panel(llm_model, whisper_model, device_mode):
     console.print(Panel(Markdown(welcome_text), title="Jarvis v1.0", border_style="cyan"))
 
 def main():
-    # Prompt for audio source selection
-    console.print(Panel(
-        "[bold cyan]🎙️ Seleção da Fonte de Áudio[/bold cyan]\n\n"
-        "[1] **Áudio do Computador** (WASAPI Loopback - grava a chamada/speakers)\n"
-        "[2] **Microfone** (Grava a sua própria voz ou o som do ambiente)",
-        title="Jarvis Setup",
-        border_style="cyan"
-    ))
-    
-    choice = ""
-    while choice not in ("1", "2"):
-        choice = input("Selecione a opção [1 ou 2, padrão: 1]: ").strip()
-        if not choice:
-            choice = "1"
+    clear_gpu_memory()
+    import argparse
+    parser = argparse.ArgumentParser(description="Jarvis Interview Copilot")
+    parser.add_argument("--whisper-device", type=str, default="cuda", choices=["auto", "cuda", "cpu"],
+                        help="Device to run Whisper (default: cuda)")
+    parser.add_argument("--llm-device", type=str, default="cuda", choices=["auto", "cuda", "cpu"],
+                        help="Device to run LLM (default: cuda)")
+    parser.add_argument("--whisper-model", type=str, default="base",
+                        help="Whisper model size (default: base)")
+    parser.add_argument("--max-chars", type=int, default=6000,
+                        help="Max context characters for RAG (default: 6000)")
+    parser.add_argument("--audio-source", type=str, default=None, choices=["1", "2"],
+                        help="Audio source: 1 for Computer, 2 for Microphone")
+    args = parser.parse_args()
+
+    # Prompt for audio source selection if not provided in CLI
+    choice = args.audio_source
+    if not choice:
+        console.print(Panel(
+            "[bold cyan]🎙️ Seleção da Fonte de Áudio[/bold cyan]\n\n"
+            "[1] **Áudio do Computador** (WASAPI Loopback - grava a chamada/speakers)\n"
+            "[2] **Microfone** (Grava a sua própria voz ou o som do ambiente)",
+            title="Jarvis Setup",
+            border_style="cyan"
+        ))
+        
+        choice = ""
+        while choice not in ("1", "2"):
+            choice = input("Selecione a opção [1 ou 2, padrão: 1]: ").strip()
+            if not choice:
+                choice = "1"
             
     device_mode = "loopback" if choice == "1" else "microphone"
     speaker_label = "Recrutador" if device_mode == "loopback" else "Você/Microfone"
 
     # Configuration
     LLM_MODEL = "qwen2.5-1.5b-ct2"
-    WHISPER_MODEL_SIZE = "large-v3"
-    WHISPER_DEVICE = "auto"  # Detects and uses "cuda" if Nvidia GPU is available
-    LLM_DEVICE = "auto"      # Detects and uses "cuda" if Nvidia GPU is available
+    WHISPER_MODEL_SIZE = args.whisper_model
+    WHISPER_DEVICE = args.whisper_device
+    LLM_DEVICE = args.llm_device
+    MAX_CHARS = args.max_chars
     
     # Thread-safe queue for audio files
     audio_queue = queue.Queue()
+    
+    # Flag to prevent concurrent GPU execution of STT and LLM
+    is_generating = threading.Event()
     
     # Initialize Assistant Engine (Local Whisper + Local Qwen)
     print_welcome_panel(LLM_MODEL, WHISPER_MODEL_SIZE, device_mode)
     assistant = AssistantEngine(
         whisper_model_size=WHISPER_MODEL_SIZE,
         whisper_device=WHISPER_DEVICE,
-        llm_device=LLM_DEVICE
+        llm_device=LLM_DEVICE,
+        max_chars=MAX_CHARS
     )
     
     # Initialize Audio Listener
@@ -144,12 +166,16 @@ def main():
                 panel_title = "Sugestão de Resposta (Jarvis)"
                 panel = Panel("", title=panel_title, border_style="green", expand=False)
                 
-                with Live(panel, console=console, auto_refresh=False) as live:
-                    def stream_cb(current_text):
-                        live.update(Panel(Markdown(current_text), title=panel_title, border_style="green", expand=False))
-                        live.refresh()
-                    
-                    answer = assistant.generate_answer(question_text, callback=stream_cb)
+                is_generating.set()
+                try:
+                    with Live(panel, console=console, auto_refresh=False) as live:
+                        def stream_cb(current_text):
+                            live.update(Panel(Markdown(current_text), title=panel_title, border_style="green", expand=False))
+                            live.refresh()
+                        
+                        answer = assistant.generate_answer(question_text, callback=stream_cb)
+                finally:
+                    is_generating.clear()
                 
                 console.print("\n[dim]Aguardando próxima pergunta... [Enter] para cortar | [Q] sair[/dim]")
                 
@@ -175,6 +201,10 @@ def main():
         last_text = ""
         
         while not stop_live_transcription.is_set():
+            if is_generating.is_set():
+                time.sleep(0.1)
+                continue
+                
             if listener.is_speech_active:
                 frames = listener.get_current_frames()
                 # Run live STT only if we have at least 1 second of audio
@@ -273,12 +303,16 @@ def main():
         panel_title = "Sugestão de Resposta (Regenerada)"
         panel = Panel("", title=panel_title, border_style="green", expand=False)
         
-        with Live(panel, console=console, auto_refresh=False) as live:
-            def stream_cb(current_text):
-                live.update(Panel(Markdown(current_text), title=panel_title, border_style="green", expand=False))
-                live.refresh()
-                
-            answer = assistant.regenerate_last_answer(callback=stream_cb)
+        is_generating.set()
+        try:
+            with Live(panel, console=console, auto_refresh=False) as live:
+                def stream_cb(current_text):
+                    live.update(Panel(Markdown(current_text), title=panel_title, border_style="green", expand=False))
+                    live.refresh()
+                    
+                answer = assistant.regenerate_last_answer(callback=stream_cb)
+        finally:
+            is_generating.clear()
             
         console.print("\n[dim]Aguardando próxima pergunta...[/dim]")
 

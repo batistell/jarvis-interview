@@ -29,9 +29,58 @@ from transformers import AutoTokenizer
 from faster_whisper import WhisperModel
 import repo_indexer
 
+def clear_gpu_memory():
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except ImportError:
+        pass
+
+def diagnose_and_terminate_on_oom(exception):
+    print("\n" + "="*70, file=sys.stderr)
+    print(f"[CRITICAL ERROR] A execução do modelo falhou devido a falta de memória na GPU (Out of Memory)!", file=sys.stderr)
+    print(f"Detalhes técnicos do erro: {exception}", file=sys.stderr)
+    print("="*70, file=sys.stderr)
+    print("[*] Diagnosticando o uso de VRAM da GPU (NVIDIA-SMI)...", file=sys.stderr)
+    
+    import subprocess
+    try:
+        # Request a list of active processes using GPU compute
+        res = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_gpu_memory", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            print("[!] Processos/Programas utilizando a GPU no momento:", file=sys.stderr)
+            print(res.stdout.strip(), file=sys.stderr)
+        else:
+            # Fallback to general nvidia-smi if the specific query was empty or failed
+            res_gen = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=False)
+            if res_gen.returncode == 0:
+                print("[!] Status geral da GPU (NVIDIA-SMI):", file=sys.stderr)
+                print(res_gen.stdout.strip(), file=sys.stderr)
+            else:
+                print("[-] Não foi possível executar nvidia-smi no sistema.", file=sys.stderr)
+    except Exception as e:
+        print(f"[-] Falha ao diagnosticar processos da GPU: {e}", file=sys.stderr)
+        
+    print("\n[!] Finalizando a aplicação imediatamente para evitar instabilidade.", file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    import os
+    os._exit(1)
+
 class AssistantEngine:
-    def __init__(self, ollama_model=None, whisper_model_size="base", whisper_device="auto", llm_device="auto"):
+    def __init__(self, ollama_model=None, whisper_model_size="base", whisper_device="cuda", llm_device="cuda", max_chars=6000):
+        clear_gpu_memory()
         self.whisper_model_size = whisper_model_size
+        self.max_chars = max_chars
         
         # Local paths
         project_root = repo_indexer.get_project_root()
@@ -96,6 +145,9 @@ class AssistantEngine:
                     except:
                         pass
             except Exception as e:
+                err_msg = str(e).lower()
+                if "out of memory" in err_msg or "allocation" in err_msg or "cuda_error" in err_msg:
+                    diagnose_and_terminate_on_oom(e)
                 print(f"[!] Warning: Failed to load or warm up Whisper on GPU: {e}. Falling back to CPU.", file=sys.stderr)
                 self.whisper = None
                 self.whisper_device = "cpu"
@@ -218,6 +270,7 @@ CONTEXTO RELEVANTE DO PROJETO:
         if self.generator is not None:
             return
             
+        clear_gpu_memory()
         import ctranslate2
         from transformers import AutoTokenizer
         
@@ -241,6 +294,9 @@ CONTEXTO RELEVANTE DO PROJETO:
                 self.generator.generate_batch([warmup_tokens], max_length=5)
                 print("[+] Qwen model warmed up on GPU successfully.")
             except Exception as e:
+                err_msg = str(e).lower()
+                if "out of memory" in err_msg or "allocation" in err_msg or "cuda_error" in err_msg:
+                    diagnose_and_terminate_on_oom(e)
                 print(f"[!] Warning: Failed to load or warm up Qwen on GPU: {e}. Falling back to CPU.", file=sys.stderr)
                 self.generator = None
                 self.llm_device = "cpu"
@@ -273,8 +329,10 @@ CONTEXTO RELEVANTE DO PROJETO:
         self.codebase_docs = repo_indexer.index_codebase_as_dict(include_code=False)
         print(f"[+] Context ready. Indexed {len(self.codebase_docs)} documents.")
 
-    def _retrieve_relevant_context(self, question, max_chars=25000):
+    def _retrieve_relevant_context(self, question, max_chars=None):
         """Retorna os documentos mais relevantes do projeto com base nas palavras-chave da pergunta (Mini-RAG)."""
+        if max_chars is None:
+            max_chars = self.max_chars
         stopwords = {
             "de", "a", "o", "que", "e", "do", "da", "em", "um", "para", "com", "na", "no", 
             "uma", "os", "as", "se", "por", "como", "mais", "ao", "aos", "como", "foi", 
@@ -327,10 +385,11 @@ CONTEXTO RELEVANTE DO PROJETO:
         if not question_text:
             return "Nenhuma fala detectada."
             
+        clear_gpu_memory()
         self._load_llm()
         
         # Retrieve the relevant context dynamically (RAG)
-        codebase_context = self._retrieve_relevant_context(question_text)
+        codebase_context = self._retrieve_relevant_context(question_text, max_chars=self.max_chars)
         system_prompt = self._build_system_prompt(codebase_context)
             
         # Limit history to the last 6 messages (3 turns) to keep context and inference window fast
@@ -383,6 +442,9 @@ CONTEXTO RELEVANTE DO PROJETO:
             
             return answer_text
         except Exception as e:
+            err_msg = str(e).lower()
+            if "out of memory" in err_msg or "allocation" in err_msg or "cuda_error" in err_msg:
+                diagnose_and_terminate_on_oom(e)
             return f"Erro ao gerar resposta com LLM local: {e}"
 
     def regenerate_last_answer(self, callback=None):

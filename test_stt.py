@@ -8,7 +8,7 @@ import urllib.request
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
 
-from assistant_engine import AssistantEngine
+from assistant_engine import AssistantEngine, clear_gpu_memory
 
 class TestSTT(unittest.TestCase):
     @classmethod
@@ -24,10 +24,11 @@ class TestSTT(unittest.TestCase):
         else:
             print(f"\n[+] Using existing test audio: {cls.dest} ({os.path.getsize(cls.dest)} bytes)")
             
+        clear_gpu_memory()
         cls.engine = AssistantEngine(
-            whisper_model_size="large-v3", 
-            whisper_device="auto", 
-            llm_device="auto"
+            whisper_model_size="base", 
+            whisper_device="cuda", 
+            llm_device="cuda"
         )
 
     def test_stt_transcription_and_response(self):
