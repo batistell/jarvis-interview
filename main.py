@@ -64,8 +64,8 @@ def main():
                         help="Device to run Whisper (default: cuda)")
     parser.add_argument("--llm-device", type=str, default="cuda", choices=["auto", "cuda", "cpu"],
                         help="Device to run LLM (default: cuda)")
-    parser.add_argument("--whisper-model", type=str, default="base",
-                        help="Whisper model size (default: base)")
+    parser.add_argument("--whisper-model", type=str, default="large-v3",
+                        help="Whisper model size (default: large-v3)")
     parser.add_argument("--max-chars", type=int, default=6000,
                         help="Max context characters for RAG (default: 6000)")
     parser.add_argument("--audio-source", type=str, default=None, choices=["1", "2"],
@@ -232,12 +232,12 @@ def main():
                         
                         audio_float32_input = mono_16k.astype(np.float32)
                         
-                        # Transcribe locally with beam_size=1 and VAD filter enabled to strip silences/noise
+                        # Transcribe locally with beam_size=1
                         segments, info = assistant.whisper.transcribe(
                             audio_float32_input, 
                             language="pt", 
                             beam_size=1,
-                            vad_filter=True
+                            vad_filter=False
                         )
                         text = " ".join([segment.text for segment in segments]).strip()
                         

@@ -26,7 +26,7 @@ class TestSTT(unittest.TestCase):
             
         clear_gpu_memory()
         cls.engine = AssistantEngine(
-            whisper_model_size="base", 
+            whisper_model_size="large-v3", 
             whisper_device="cuda", 
             llm_device="cuda"
         )

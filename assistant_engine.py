@@ -40,6 +40,54 @@ def clear_gpu_memory():
     except ImportError:
         pass
 
+def get_memory_status():
+    """Returns a tuple (ram_mb, vram_mb) representing current RAM and GPU VRAM usage."""
+    # RAM (Process Working Set) on Windows using ctypes
+    ram_mb = 0.0
+    try:
+        import ctypes
+        from ctypes import wintypes
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+        p = ctypes.windll.kernel32.GetCurrentProcess()
+        c = PROCESS_MEMORY_COUNTERS()
+        c.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        psapi = ctypes.windll.psapi
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        if psapi.GetProcessMemoryInfo(p, ctypes.byref(c), c.cb):
+            ram_mb = c.WorkingSetSize / (1024.0 * 1024.0)
+    except Exception:
+        pass
+
+    # VRAM (System GPU Memory Used) via nvidia-smi
+    vram_mb = 0.0
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if res.returncode == 0:
+            vram_mb = float(res.stdout.strip())
+    except Exception:
+        pass
+
+    return ram_mb, vram_mb
+
 def diagnose_and_terminate_on_oom(exception):
     print("\n" + "="*70, file=sys.stderr)
     print(f"[CRITICAL ERROR] A execução do modelo falhou devido a falta de memória na GPU (Out of Memory)!", file=sys.stderr)
@@ -77,8 +125,14 @@ def diagnose_and_terminate_on_oom(exception):
     os._exit(1)
 
 class AssistantEngine:
-    def __init__(self, ollama_model=None, whisper_model_size="base", whisper_device="cuda", llm_device="cuda", max_chars=6000):
+    def __init__(self, ollama_model=None, whisper_model_size="large-v3", whisper_device="cuda", llm_device="cuda", max_chars=6000):
+        ram_before, vram_before = get_memory_status()
         clear_gpu_memory()
+        ram_after, vram_after = get_memory_status()
+        
+        print(f"\033[32m[Memory] Antes de limpar: RAM: {ram_before:.2f} MB | VRAM: {vram_before:.2f} MB\033[0m")
+        print(f"\033[32m[Memory] Depois de limpar a VRAM: RAM: {ram_after:.2f} MB | VRAM: {vram_after:.2f} MB\033[0m")
+        
         self.whisper_model_size = whisper_model_size
         self.max_chars = max_chars
         
@@ -190,6 +244,12 @@ class AssistantEngine:
                 print(f"[-] Error loading Whisper model on CPU: {e}", file=sys.stderr)
                 sys.exit(1)
             
+        # Whisper model is loaded and warmed up. Measure consumption:
+        ram_after_whisper, vram_after_whisper = get_memory_status()
+        ram_whisper_diff = ram_after_whisper - ram_after
+        vram_whisper_diff = max(0.0, vram_after_whisper - vram_after)
+        print(f"\033[32m[Memory] Consumo do Whisper: RAM: {ram_whisper_diff:.2f} MB | VRAM: {vram_whisper_diff:.2f} MB\033[0m")
+            
         # LLM placeholders
         self.generator = None
         self.tokenizer = None
@@ -201,7 +261,17 @@ class AssistantEngine:
         self.generation_lock = threading.Lock()
         
         # Load LLM model eagerly at startup
+        ram_before_llm, vram_before_llm = get_memory_status()
         self._load_llm()
+        ram_after_llm, vram_after_llm = get_memory_status()
+        
+        ram_llm_diff = ram_after_llm - ram_before_llm
+        vram_llm_diff = max(0.0, vram_after_llm - vram_before_llm)
+        print(f"\033[32m[Memory] Consumo do Qwen LLM: RAM: {ram_llm_diff:.2f} MB | VRAM: {vram_llm_diff:.2f} MB\033[0m")
+        
+        # Memory at the end of startup
+        ram_final, vram_final = get_memory_status()
+        print(f"\033[32m[Memory] Ao final do startup: RAM: {ram_final:.2f} MB | VRAM: {vram_final:.2f} MB\033[0m")
 
     def _build_system_prompt(self, codebase_context):
         return f"""Você é o Jarvis, um copiloto de inteligência artificial. O seu papel é auxiliar o candidato a responder perguntas técnicas de entrevista sobre o projeto "Face Registry" em tempo real.
@@ -253,12 +323,12 @@ CONTEXTO RELEVANTE DO PROJETO:
             if not os.path.exists(wav_path_or_ndarray):
                 return ""
             
-        # Transcribe with Portuguese hint and VAD filter enabled to strip silences/noise
+        # Transcribe with Portuguese hint
         segments, info = self.whisper.transcribe(
             wav_path_or_ndarray, 
             language="pt", 
             beam_size=1,
-            vad_filter=True
+            vad_filter=False
         )
         text = " ".join([segment.text for segment in segments]).strip()
         

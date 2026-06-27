@@ -256,7 +256,7 @@ class AudioListener:
                                 self.silence_start_time = time.time()
                             elif time.time() - self.silence_start_time >= self.silence_seconds:
                                 # Silence duration exceeded: Speech turn ended
-                                min_speech_duration_sec = 0.4
+                                min_speech_duration_sec = 0.1
                                 min_speech_chunks = int(min_speech_duration_sec * self.rate / self.chunk_size)
                                 if self.speech_chunks_count >= min_speech_chunks:
                                     self._save_and_queue_segment()
@@ -297,7 +297,7 @@ class AudioListener:
                             self.silence_start_time = time.time()
                         elif time.time() - self.silence_start_time >= self.silence_seconds:
                             # Silence duration exceeded: Speech turn ended
-                            min_speech_duration_sec = 0.4
+                            min_speech_duration_sec = 0.1
                             min_speech_chunks = int(min_speech_duration_sec * self.rate / self.chunk_size)
                             if self.speech_chunks_count >= min_speech_chunks:
                                 self._save_and_queue_segment()
